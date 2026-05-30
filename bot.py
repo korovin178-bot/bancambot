@@ -234,7 +234,7 @@ async def run_websocket():
         try:
             async with websockets.connect(
                 WS_URL,
-                additional_headers=headers,
+                extra_headers=headers,
                 ping_interval=25,
                 ping_timeout=20,
                 close_timeout=10,
