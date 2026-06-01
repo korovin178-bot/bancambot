@@ -208,6 +208,55 @@ async def keep_alive():
     await web.TCPSite(runner, "0.0.0.0", port).start()
     log("INFO", f"🌐 Keep-alive на порту {port}")
 
+# ─── Клик по Cloudflare Turnstile ─────────────────────────────────────────────
+async def try_click_turnstile(page) -> bool:
+    """
+    Пытается найти и нажать галочку Cloudflare Turnstile.
+    Turnstile живёт в iframe, поэтому пробуем несколько способов.
+    Возвращает True если клик был сделан.
+    """
+    # Способ 1: найти iframe Turnstile и кликнуть чекбокс внутри
+    try:
+        for frame in page.frames:
+            url = (frame.url or "").lower()
+            if "challenges.cloudflare.com" in url or "turnstile" in url:
+                # внутри iframe ищем чекбокс
+                for sel in ["input[type=checkbox]", "label", "#challenge-stage", "body"]:
+                    try:
+                        el = await frame.wait_for_selector(sel, timeout=3000)
+                        if el:
+                            await el.click(timeout=3000)
+                            log("INFO", f"☑️ Клик по Turnstile iframe ({sel})")
+                            return True
+                    except Exception:
+                        continue
+    except Exception as e:
+        log("INFO", f"turnstile iframe способ не сработал: {e}")
+
+    # Способ 2: клик по видимому контейнеру Turnstile на странице по координатам
+    try:
+        for sel in [
+            "div.cf-turnstile",
+            "#cf-turnstile",
+            "[class*=turnstile]",
+            "iframe[src*=challenges.cloudflare.com]",
+        ]:
+            try:
+                box = await page.locator(sel).first.bounding_box(timeout=3000)
+                if box:
+                    # галочка обычно слева внутри виджета
+                    x = box["x"] + 30
+                    y = box["y"] + box["height"] / 2
+                    await page.mouse.click(x, y)
+                    log("INFO", f"☑️ Клик по координатам Turnstile ({sel})")
+                    return True
+            except Exception:
+                continue
+    except Exception as e:
+        log("INFO", f"turnstile координаты не сработали: {e}")
+
+    return False
+
 # ─── Браузерный цикл ──────────────────────────────────────────────────────────
 async def browser_loop():
     # настройки прокси для Playwright
@@ -286,11 +335,32 @@ async def browser_loop():
                 log("INFO", f"📄 Заголовок страницы: {title}")
                 await tg_diag(f"📄 Заголовок страницы: «{title}»")
 
-                if "moment" in title.lower() or "attention" in title.lower():
-                    await tg_diag("⚠️ Cloudflare-челлендж. Жду 40с на авто-проход (stealth)...")
-                    await page.wait_for_timeout(40000)
+                # ── Прохождение Cloudflare Turnstile (клик по галочке) ──────
+                if "moment" in title.lower() or "attention" in title.lower() or "проверк" in title.lower():
+                    await tg_diag("⚠️ Turnstile-челлендж. Пытаюсь нажать галочку...")
+                    clicked = await try_click_turnstile(page)
+                    if clicked:
+                        await tg_diag("☑️ Кликнул по галочке, жду прохождения...")
+                    else:
+                        await tg_diag("⚠️ Галочку не нашёл, жду авто-прохода...")
+
+                    # ждём смены заголовка до 45 сек
+                    passed = False
+                    for i in range(45):
+                        await page.wait_for_timeout(1000)
+                        t = (await page.title()).lower()
+                        if "moment" not in t and "attention" not in t and "проверк" not in t:
+                            passed = True
+                            break
+                        # повторная попытка клика на 10-й и 25-й секунде
+                        if i in (10, 25):
+                            await try_click_turnstile(page)
+
                     title = await page.title()
-                    await tg_diag(f"📄 После ожидания: «{title}»")
+                    if passed:
+                        await tg_diag(f"✅ Челлендж пройден! Заголовок: «{title}»")
+                    else:
+                        await tg_diag(f"❌ Не прошёл за 45с. Заголовок: «{title}»")
 
                 # ждём появления WebSocket до 30 сек
                 for _ in range(30):
