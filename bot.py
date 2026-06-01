@@ -192,6 +192,43 @@ def route(event: str, data):
     elif "rain" in event.lower():
         log.info(f"🔔 Прочее rain-событие: {event} | {str(data)[:120]}")
 
+# ─── Авто-получение cf_clearance через прокси ────────────────────────────────
+def fetch_cf_cookies(proxies) -> dict:
+    """
+    Заходит на bandit.camp через прокси обычным HTTPS-запросом.
+    Если Cloudflare пропускает без интерактивного челленджа —
+    возвращает выданные cookie (включая cf_clearance).
+    """
+    out = {}
+    try:
+        session = cffi.Session(impersonate=IMPERSONATE)
+        r = session.get(
+            SITE_URL,
+            headers={"User-Agent": USER_AGENT},
+            proxies=proxies,
+            timeout=30,
+            allow_redirects=True,
+        )
+        log.info(f"🍪 GET {SITE_URL} → HTTP {r.status_code}")
+        # вытаскиваем все cookie из сессии
+        try:
+            jar = session.cookies.get_dict()
+        except Exception:
+            jar = dict(r.cookies)
+        for k, v in jar.items():
+            out[k] = v
+        if "cf_clearance" in out:
+            log.info("🍪 ✅ Получен свежий cf_clearance через прокси!")
+        else:
+            got = ", ".join(out.keys()) if out else "ничего"
+            log.warning(f"🍪 ⚠️ cf_clearance НЕ выдан. Пришли cookie: {got}")
+            # признак интерактивного челленджа
+            if "just a moment" in (r.text or "").lower():
+                log.warning("🍪 Cloudflare показывает интерактивный челлендж (нужен браузер).")
+    except Exception as e:
+        log.error(f"🍪 Ошибка получения cookie: {type(e).__name__}: {e}")
+    return out
+
 def handle_message(raw: str):
     try:
         obj = json.loads(raw)
@@ -212,9 +249,6 @@ def ws_thread():
         "User-Agent": USER_AGENT,
         "Origin": "https://bandit.camp",
     }
-    cookies = {}
-    if CF_CLEARANCE:
-        cookies["cf_clearance"] = CF_CLEARANCE
 
     proxies = None
     if PROXY_URL:
@@ -227,7 +261,18 @@ def ws_thread():
         log.info("🌍 Прокси НЕ задан — подключаюсь напрямую")
 
     while True:
-        ck = "с cookie" if CF_CLEARANCE else "БЕЗ cookie"
+        # 1) Получаем свежие cookie через прокси (тот же IP что и WS)
+        cookies = {}
+        if CF_CLEARANCE:
+            cookies["cf_clearance"] = CF_CLEARANCE
+            log.info("🍪 Использую CF_CLEARANCE из переменной окружения")
+        else:
+            fetched = fetch_cf_cookies(proxies)
+            if "cf_clearance" in fetched:
+                cookies = fetched
+
+        # 2) Подключаемся к WebSocket
+        ck = "с cookie" if cookies.get("cf_clearance") else "БЕЗ cookie"
         log.info(f"🔌 Подключаюсь к {WS_URL} (impersonate={IMPERSONATE}, {ck}) ...")
         try:
             session = cffi.Session(impersonate=IMPERSONATE)
