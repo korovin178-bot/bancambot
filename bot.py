@@ -1,94 +1,45 @@
 """
-Bandit.camp Rain Bot v4 — curl_cffi
-Маскирует TLS-отпечаток под настоящий Chrome чтобы обойти Cloudflare.
-Протокол: {"a": [событие, данные], "i": номер}
+Bandit.camp Rain Bot v5 — Playwright (реальный Chromium через прокси)
+Браузер открывает сайт, WebSocket создаётся внутри страницы,
+кадры перехватываются через page.on("websocket").
+Протокол сообщений: {"a": [событие, данные], "i": номер}
 """
 
+import asyncio
 import json
-import logging
 import os
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from curl_cffi import requests as cffi
-from curl_cffi import CurlHttpVersion
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
-import asyncio
-from urllib.parse import quote
+from playwright.async_api import async_playwright
 
-# ─── Логирование: print с flush, чтобы Render точно показывал из всех потоков ─
-def log_msg(level: str, msg: str):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [{level}] {msg}", flush=True)
+# ─── Логи (print с flush — надёжно видно в Render) ───────────────────────────
+def log(level, msg):
+    print(f"{time.strftime('%H:%M:%S')} [{level}] {msg}", flush=True)
     sys.stdout.flush()
-
-class _Log:
-    def info(self, m):    log_msg("INFO", m)
-    def warning(self, m): log_msg("WARN", m)
-    def error(self, m):   log_msg("ERROR", m)
-    def debug(self, m):   pass  # отключено, чтобы не засорять
-
-log = _Log()
-
-# приглушаем болтливые библиотеки (httpx от telegram)
-logging.basicConfig(level=logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHANNEL = os.environ["TELEGRAM_CHANNEL"]
 
-CF_CLEARANCE = os.environ.get("CF_CLEARANCE", "")
-USER_AGENT   = os.environ.get(
+USER_AGENT = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
 )
 
-WS_URL   = "wss://api.bandit.camp/"
 SITE_URL = "https://bandit.camp"
 VALUE_DIVISOR = 100
 
-# curl_cffi имперсонация — "chrome" = всегда последняя доступная версия
-IMPERSONATE = os.environ.get("IMPERSONATE", "chrome")
-
-# ─── Прокси ───────────────────────────────────────────────────────────────────
-# Можно задать готовый URL в PROXY (http://user:pass@host:port)
-# ИЛИ по частям: PROXY_LOGIN, PROXY_PASS, PROXY_HOST, PROXY_PORT
-def build_proxy() -> Optional[str]:
-    full = os.environ.get("PROXY", "").strip()
-    if full:
-        return full
-
-    login = os.environ.get("PROXY_LOGIN", "").strip()
-    passwd = os.environ.get("PROXY_PASS", "").strip()
-    host = os.environ.get("PROXY_HOST", "").strip()
-    port = os.environ.get("PROXY_PORT", "").strip()
-
-    if host and port:
-        if login and passwd:
-            # URL-кодируем логин и пароль (в логине бывают ; и спецсимволы)
-            l = quote(login, safe="")
-            p = quote(passwd, safe="")
-            return f"http://{l}:{p}@{host}:{port}"
-        return f"http://{host}:{port}"
-    return None
-
-PROXY_URL = build_proxy()
-
-# ─── Счётчик трафика ──────────────────────────────────────────────────────────
-traffic_bytes = 0
-traffic_lock = threading.Lock()
-
-def add_traffic(n: int):
-    global traffic_bytes
-    with traffic_lock:
-        traffic_bytes += n
-
+# Прокси по частям (как в Render Environment)
+PROXY_HOST  = os.environ.get("PROXY_HOST", "").strip()
+PROXY_PORT  = os.environ.get("PROXY_PORT", "").strip()
+PROXY_LOGIN = os.environ.get("PROXY_LOGIN", "").strip()
+PROXY_PASS  = os.environ.get("PROXY_PASS", "").strip()
 
 # ─── State ────────────────────────────────────────────────────────────────────
 @dataclass
@@ -103,7 +54,7 @@ class Rain:
 
 active: dict[str, Rain] = {}
 bot: Optional[Bot] = None
-loop: Optional[asyncio.AbstractEventLoop] = None
+traffic_bytes = 0
 
 # ─── Форматирование ───────────────────────────────────────────────────────────
 def fmt(rain: Rain) -> str:
@@ -129,133 +80,94 @@ def fmt(rain: Rain) -> str:
         f"🔥 <a href=\"{SITE_URL}\">Зайти на bandit.camp</a>"
     )
 
-# ─── Telegram (вызывается из другого потока через loop) ──────────────────────
-async def _send(rain: Rain):
+# ─── Telegram ─────────────────────────────────────────────────────────────────
+async def tg_send(rain: Rain):
     try:
         msg = await bot.send_message(
             chat_id=TELEGRAM_CHANNEL, text=fmt(rain),
             parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         rain.msg_id = msg.message_id
-        log.info(f"✉️  Отправлено: value={rain.value}$ users={rain.user_count}")
+        log("INFO", f"✉️  Отправлено: value={rain.value}$ users={rain.user_count}")
     except TelegramError as e:
-        log.error(f"send error: {e}")
+        log("ERROR", f"send error: {e}")
 
-async def _edit(rain: Rain):
+async def tg_edit(rain: Rain):
     if not rain.msg_id:
-        await _send(rain); return
+        await tg_send(rain); return
     try:
         await bot.edit_message_text(
             chat_id=TELEGRAM_CHANNEL, message_id=rain.msg_id, text=fmt(rain),
             parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        log.info(f"✏️  Обновлено: value={rain.value}$ users={rain.user_count} status={rain.status}")
+        log("INFO", f"✏️  Обновлено: value={rain.value}$ users={rain.user_count} status={rain.status}")
     except TelegramError as e:
         if "not modified" not in str(e).lower():
-            log.error(f"edit error: {e}")
+            log("ERROR", f"edit error: {e}")
 
-def send_threadsafe(coro):
-    """Безопасно запускает корутину Telegram из WS-потока"""
-    if loop:
-        asyncio.run_coroutine_threadsafe(coro, loop)
+# ─── Таймер обновления ────────────────────────────────────────────────────────
+async def timer_updater(rain: Rain):
+    while rain.status == "active":
+        await asyncio.sleep(30)
+        if rain.status == "active" and rain.msg_id:
+            now_ms = int(time.time() * 1000)
+            if rain.started_at_ms and rain.duration_ms and now_ms > rain.started_at_ms + rain.duration_ms:
+                rain.status = "finished"
+            await tg_edit(rain)
 
 # ─── Обработчики событий ──────────────────────────────────────────────────────
-def on_rain(data: dict):
+async def on_rain(data: dict):
     started = int(data.get("startedAt") or 0)
     value   = float(data.get("value") or 0) / VALUE_DIVISOR
     users   = int(data.get("userCount") or 0)
     dur     = int(data.get("duration") or 0)
     key = str(started) if started else f"rain_{int(time.time())}"
-    log.info(f"🌧 chat.rain: value={value}$ users={users} dur={dur}ms")
-
+    log("INFO", f"🌧 chat.rain: value={value}$ users={users} dur={dur}ms")
     rain = active.get(key)
     if rain is None:
-        rain = Rain(rain_key=key, value=value, user_count=users,
-                    duration_ms=dur, started_at_ms=started)
+        rain = Rain(rain_key=key, value=value, user_count=users, duration_ms=dur, started_at_ms=started)
         active[key] = rain
-        send_threadsafe(_send(rain))
+        await tg_send(rain)
+        asyncio.create_task(timer_updater(rain))
     else:
         changed = (abs(rain.value - value) > 0.005) or (rain.user_count != users)
         rain.value = value; rain.user_count = users
         if changed:
-            send_threadsafe(_edit(rain))
+            await tg_edit(rain)
 
-def on_rain_join(data: dict):
+async def on_rain_join(data: dict):
     users = int(data.get("userCount") or 0)
     if not active: return
     rain = max(active.values(), key=lambda r: r.started_at_ms)
     if rain.status == "active" and users and users != rain.user_count:
         rain.user_count = users
-        send_threadsafe(_edit(rain))
+        await tg_edit(rain)
 
-def on_rain_payout(data: dict):
+async def on_rain_payout(data: dict):
     users = int(data.get("userCount") or data.get("recipients") or 0)
     total = data.get("total") or data.get("value")
-    log.info(f"✅ payoutSummary: users={users} total={total}")
+    log("INFO", f"✅ payoutSummary: users={users} total={total}")
     if not active: return
     rain = max(active.values(), key=lambda r: r.started_at_ms)
     if users: rain.user_count = users
     if total is not None: rain.value = float(total) / VALUE_DIVISOR
     rain.status = "finished"
-    send_threadsafe(_edit(rain))
+    await tg_edit(rain)
 
-def route(event: str, data):
+async def route(event: str, data):
     if not isinstance(data, dict): data = {}
     if event == "chat.rain":
-        on_rain(data)
+        await on_rain(data)
     elif event == "chat.rain.join":
-        on_rain_join(data)
+        await on_rain_join(data)
     elif event in ("chat.rain.payoutSummary", "chat.rain.payout"):
-        on_rain_payout(data)
+        await on_rain_payout(data)
     elif "rain" in event.lower():
-        log.info(f"🔔 Прочее rain-событие: {event} | {str(data)[:120]}")
+        log("INFO", f"🔔 Прочее rain-событие: {event} | {str(data)[:120]}")
 
-# ─── Авто-получение cf_clearance через прокси ────────────────────────────────
-def fetch_cf_cookies(proxies) -> dict:
-    """
-    Заходит на bandit.camp через прокси обычным HTTPS-запросом.
-    Если Cloudflare пропускает без интерактивного челленджа —
-    возвращает выданные cookie (включая cf_clearance).
-    """
-    out = {}
-    # Хосты пробуем по очереди: СНАЧАЛА api.bandit.camp (хост WebSocket!),
-    # потом главная. cf_clearance выдаётся per-host, нам важен именно api.
-    urls = ["https://api.bandit.camp/", "https://bandit.camp/"]
+async def handle_frame(payload: str):
+    global traffic_bytes
+    traffic_bytes += len(payload.encode("utf-8")) if isinstance(payload, str) else len(payload)
     try:
-        session = cffi.Session(impersonate=IMPERSONATE)
-        for u in urls:
-            try:
-                r = session.get(
-                    u,
-                    headers={"User-Agent": USER_AGENT, "Referer": "https://bandit.camp/"},
-                    proxies=proxies,
-                    timeout=30,
-                    allow_redirects=True,
-                )
-                log.info(f"🍪 GET {u} → HTTP {r.status_code}")
-                if "just a moment" in (r.text or "").lower():
-                    log.warning(f"🍪 {u}: Cloudflare показывает интерактивный челлендж.")
-            except Exception as e:
-                log.warning(f"🍪 GET {u} ошибка: {type(e).__name__}: {e}")
-
-        # собираем все cookie из сессии (с обоих хостов)
-        try:
-            jar = session.cookies.get_dict()
-        except Exception:
-            jar = {}
-        for k, v in jar.items():
-            out[k] = v
-
-        if "cf_clearance" in out:
-            log.info("🍪 ✅ Получен cf_clearance!")
-        else:
-            got = ", ".join(out.keys()) if out else "ничего"
-            log.warning(f"🍪 ⚠️ cf_clearance НЕ выдан. Пришли cookie: {got}")
-    except Exception as e:
-        log.error(f"🍪 Ошибка получения cookie: {type(e).__name__}: {e}")
-    return out
-
-def handle_message(raw: str):
-    try:
-        obj = json.loads(raw)
+        obj = json.loads(payload)
     except (json.JSONDecodeError, TypeError):
         return
     if not isinstance(obj, dict):
@@ -263,147 +175,139 @@ def handle_message(raw: str):
     a = obj.get("a")
     if isinstance(a, list) and len(a) >= 1 and isinstance(a[0], str):
         event = a[0]
-        payload = a[1] if len(a) >= 2 else {}
-        log.debug(f"EVENT: {event} | {str(payload)[:120]}")
-        route(event, payload)
+        data = a[1] if len(a) >= 2 else {}
+        await route(event, data)
 
-# ─── WebSocket через curl_cffi (в отдельном потоке) ──────────────────────────
-def ws_thread():
-    try:
-        _ws_thread_inner()
-    except Exception as e:
-        log.error(f"💥 ws_thread упал: {type(e).__name__}: {e}")
-
-def _ws_thread_inner():
-    headers = {
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-        "User-Agent": USER_AGENT,
-        "Origin": "https://bandit.camp",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Accept-Language": "ru,en-US;q=0.9,en;q=0.8,uk;q=0.7,es;q=0.6,bs;q=0.5",
-    }
-
-    proxies = None
-    if PROXY_URL:
-        proxies = {"https": PROXY_URL, "http": PROXY_URL}
-        safe = PROXY_URL
-        if "@" in safe:
-            safe = "http://***@" + safe.split("@", 1)[1]
-        log.info(f"🌍 Использую прокси: {safe}")
-    else:
-        log.info("🌍 Прокси НЕ задан — подключаюсь напрямую")
-
-    while True:
-        # 1) Получаем свежие cookie через прокси (тот же IP что и WS)
-        cookies = {}
-        if CF_CLEARANCE:
-            cookies["cf_clearance"] = CF_CLEARANCE
-            log.info("🍪 Использую CF_CLEARANCE из переменной окружения")
-        else:
-            fetched = fetch_cf_cookies(proxies)
-            if "cf_clearance" in fetched:
-                cookies = fetched
-
-        # 2) Подключаемся к WebSocket
-        ck = "с cookie" if cookies.get("cf_clearance") else "БЕЗ cookie"
-        log.info(f"🔌 Подключаюсь к {WS_URL} (impersonate={IMPERSONATE}, {ck}) ...")
-        try:
-            session = cffi.Session(impersonate=IMPERSONATE)
-            try:
-                ws = session.ws_connect(
-                    WS_URL, headers=headers, cookies=cookies,
-                    proxies=proxies, http_version=CurlHttpVersion.V1_1,
-                )
-            except TypeError:
-                # на случай если версия curl_cffi не принимает http_version
-                ws = session.ws_connect(
-                    WS_URL, headers=headers, cookies=cookies, proxies=proxies,
-                )
-            log.info("✅ WebSocket подключён!")
-
-            while True:
-                frame = ws.recv()
-                if frame is None:
-                    break
-                data = frame[0] if isinstance(frame, tuple) else frame
-                if isinstance(data, (bytes, bytearray)):
-                    add_traffic(len(data))
-                    try:
-                        data = data.decode("utf-8")
-                    except Exception:
-                        continue
-                else:
-                    add_traffic(len(data.encode("utf-8")))
-                if data:
-                    handle_message(data)
-
-        except Exception as e:
-            msg = str(e)
-            if "403" in msg:
-                log.error("❌ 403 — Cloudflare блокирует даже через прокси/cookie. "
-                          "Проверь совпадение страны прокси и региона cookie.")
-            else:
-                log.error(f"WS error: {type(e).__name__}: {msg}")
-
-        log.info("♻️  Переподключение через 10 сек...")
-        time.sleep(10)
-
-# ─── Keep-alive HTTP сервер ───────────────────────────────────────────────────
+# ─── Keep-alive HTTP для Render ───────────────────────────────────────────────
 async def keep_alive():
     from aiohttp import web
     port = int(os.environ.get("PORT", 10000))
     async def health(request):
-        with traffic_lock:
-            mb = traffic_bytes / (1024 * 1024)
-        return web.Response(text=f"OK | active rains: {len(active)} | traffic: {mb:.2f} MB")
+        mb = traffic_bytes / (1024 * 1024)
+        return web.Response(text=f"OK | rains: {len(active)} | traffic: {mb:.3f} MB")
     app = web.Application()
     app.router.add_get("/", health)
-    app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info(f"🌐 Keep-alive на порту {port}")
+    log("INFO", f"🌐 Keep-alive на порту {port}")
 
-# ─── Репорт трафика раз в 10 минут ───────────────────────────────────────────
-async def traffic_reporter():
+# ─── Браузерный цикл ──────────────────────────────────────────────────────────
+async def browser_loop():
+    # настройки прокси для Playwright
+    proxy = None
+    if PROXY_HOST and PROXY_PORT:
+        proxy = {
+            "server": f"http://{PROXY_HOST}:{PROXY_PORT}",
+            "username": PROXY_LOGIN,
+            "password": PROXY_PASS,
+        }
+        log("INFO", f"🌍 Прокси: http://***@{PROXY_HOST}:{PROXY_PORT}")
+    else:
+        log("INFO", "🌍 Прокси НЕ задан")
+
+    # флаги для экономии RAM (Render free = 512MB)
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-software-rasterizer",
+        "--single-process",
+        "--no-zygote",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-first-run",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+    ]
+
     while True:
-        await asyncio.sleep(600)
-        with traffic_lock:
-            mb = traffic_bytes / (1024 * 1024)
-        # прогноз на месяц
-        # (грубо: текущий объём за время работы экстраполируем)
-        log.info(f"📊 Трафик с запуска: {mb:.2f} MB")
+        try:
+            async with async_playwright() as p:
+                log("INFO", "🚀 Запускаю Chromium...")
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=chromium_args,
+                    proxy=proxy,
+                )
+                context = await browser.new_context(
+                    user_agent=USER_AGENT,
+                    locale="ru-RU",
+                    viewport={"width": 1280, "height": 720},
+                )
+                # блокируем картинки/шрифты/css — экономим RAM и трафик
+                async def block_heavy(route_obj):
+                    if route_obj.request.resource_type in ("image", "font", "media", "stylesheet"):
+                        await route_obj.abort()
+                    else:
+                        await route_obj.continue_()
+                await context.route("**/*", block_heavy)
+
+                page = await context.new_page()
+
+                main_loop = asyncio.get_running_loop()
+
+                # перехват WebSocket
+                def on_ws(ws):
+                    log("INFO", f"🔌 WebSocket открыт: {ws.url}")
+                    def on_frame(payload):
+                        asyncio.run_coroutine_threadsafe(handle_frame(payload), main_loop)
+                    ws.on("framereceived", lambda p: on_frame(p))
+                    ws.on("close", lambda: log("INFO", "🔌 WebSocket закрыт"))
+
+                page.on("websocket", on_ws)
+
+                log("INFO", f"🌐 Открываю {SITE_URL} ...")
+                await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60000)
+                title = await page.title()
+                log("INFO", f"📄 Заголовок страницы: {title}")
+
+                if "just a moment" in title.lower() or "moment" in title.lower():
+                    log("WARN", "⚠️ Cloudflare челлендж. Жду 15с на авто-прохождение...")
+                    await page.wait_for_timeout(15000)
+                    title = await page.title()
+                    log("INFO", f"📄 После ожидания: {title}")
+
+                log("INFO", "✅ Страница загружена, слушаю WebSocket события...")
+
+                # держим страницу живой
+                while True:
+                    await page.wait_for_timeout(30000)
+                    # лёгкая активность чтобы соединение не засыпало
+                    try:
+                        await page.evaluate("1")
+                    except Exception:
+                        break
+
+        except Exception as e:
+            log("ERROR", f"💥 Браузер упал: {type(e).__name__}: {e}")
+
+        log("INFO", "♻️  Перезапуск браузера через 15 сек...")
+        await asyncio.sleep(15)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    global bot, loop
-    loop = asyncio.get_running_loop()
-
-    # 1) СНАЧАЛА поднимаем keep-alive порт (чтобы Render видел сервис живым)
+    global bot
     await keep_alive()
 
-    log.info("🚀 Запуск Bandit Rain Bot v4 (curl_cffi)...")
+    log("INFO", "🚀 Запуск Bandit Rain Bot v5 (Playwright)...")
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         me = await bot.get_me()
-        log.info(f"✅ Бот @{me.username} готов")
+        log("INFO", f"✅ Бот @{me.username} готов")
         await bot.send_message(
             chat_id=TELEGRAM_CHANNEL,
-            text="🤖 <b>Rain Bot v4 запущен!</b>\nОтслеживаю рейны на bandit.camp 🌧",
+            text="🤖 <b>Rain Bot v5 (Playwright) запущен!</b>\nОтслеживаю рейны 🌧",
             parse_mode=ParseMode.HTML)
     except Exception as e:
-        log.error(f"Telegram init error: {type(e).__name__}: {e}")
+        log("ERROR", f"Telegram init: {type(e).__name__}: {e}")
 
-    # 2) WebSocket в отдельном потоке
-    t = threading.Thread(target=ws_thread, daemon=True)
-    t.start()
-
-    asyncio.create_task(traffic_reporter())
-
-    # держим event loop живым
-    while True:
-        await asyncio.sleep(3600)
+    await browser_loop()
 
 if __name__ == "__main__":
     asyncio.run(main())
