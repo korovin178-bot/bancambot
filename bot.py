@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from curl_cffi import requests as cffi
+from curl_cffi import CurlHttpVersion
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -246,8 +247,12 @@ def handle_message(raw: str):
 # ─── WebSocket через curl_cffi (в отдельном потоке) ──────────────────────────
 def ws_thread():
     headers = {
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
         "User-Agent": USER_AGENT,
         "Origin": "https://bandit.camp",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "ru,en-US;q=0.9,en;q=0.8,uk;q=0.7,es;q=0.6,bs;q=0.5",
     }
 
     proxies = None
@@ -281,6 +286,7 @@ def ws_thread():
                 headers=headers,
                 cookies=cookies,
                 proxies=proxies,
+                http_version=CurlHttpVersion.V1_1,
             )
             log.info("✅ WebSocket подключён!")
 
