@@ -27,10 +27,12 @@ def log(level, msg):
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHANNEL = os.environ["TELEGRAM_CHANNEL"]
 
-USER_AGENT = os.environ.get(
-    "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+# чистим UA от любых небезопасных/невидимых символов (только печатный ASCII)
+_raw_ua = os.environ.get("USER_AGENT", "") or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 )
+USER_AGENT = "".join(c for c in _raw_ua if 32 <= ord(c) < 127).strip()
 
 SITE_URL = "https://bandit.camp"
 VALUE_DIVISOR = 100
