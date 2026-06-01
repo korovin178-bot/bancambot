@@ -377,12 +377,12 @@ async def browser_loop():
                     return any(k in t for k in ("moment", "момент", "attention", "проверк", "just a"))
 
                 if is_challenge(title):
-                    await tg_diag("⚠️ Cloudflare проверка. Терпеливо жду авто-прохода (до 2 мин)...")
-                    # Это авто-challenge без галочки — кликать не по чему,
-                    # нужно просто дать ему время «подумать». Иногда проходит
-                    # на 30-90 секунде. Ждём долго, периодически перезагружая.
+                    await tg_diag("⚠️ Cloudflare проверка. Жду авто-проход (25с)...")
+                    # С РОТАЦИОННЫМ прокси каждый заход = новый IP.
+                    # Если этот IP попал на челлендж — нет смысла долго ждать,
+                    # быстрее перезайти и получить свежий IP, где проход чаще.
                     passed = False
-                    for i in range(120):
+                    for i in range(25):
                         await page.wait_for_timeout(1000)
                         try:
                             t = await page.title()
@@ -391,23 +391,17 @@ async def browser_loop():
                         if not is_challenge(t):
                             passed = True
                             break
-                        # мягкая перезагрузка на 40-й и 80-й секунде — иногда помогает
-                        if i in (40, 80):
-                            try:
-                                await page.reload(wait_until="domcontentloaded", timeout=30000)
-                            except Exception:
-                                pass
 
                     title = await page.title()
                     if passed:
                         await tg_diag(f"✅ Проверка пройдена! «{title}»", force=True)
                     else:
-                        await tg_diag("⚠️ Не прошло за 2 мин, перезаход...")
+                        log("INFO", "челлендж не прошёл, беру новый IP")
                         try:
                             await browser.close()
                         except Exception:
                             pass
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(8)
                         continue
 
                 # ждём появления WebSocket до 40 сек
