@@ -377,7 +377,16 @@ async def browser_loop():
                     return any(k in t for k in ("moment", "момент", "attention", "проверк", "just a"))
 
                 if is_challenge(title):
-                    await tg_diag("⚠️ Turnstile-челлендж. Пытаюсь нажать галочку...")
+                    await tg_diag("⚠️ Turnstile-челлендж. Делаю скриншот и пытаюсь нажать...")
+                    # скриншот того что видит бот — отправим в канал
+                    try:
+                        shot = await page.screenshot(full_page=False)
+                        await bot.send_photo(
+                            chat_id=TELEGRAM_CHANNEL,
+                            photo=shot,
+                            caption="📸 Что видит бот на челлендже")
+                    except Exception as e:
+                        log("ERROR", f"screenshot error: {e}")
                     clicked = await try_click_turnstile(page)
                     if clicked:
                         await tg_diag("☑️ Кликнул по галочке, жду прохождения...")
