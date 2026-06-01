@@ -229,12 +229,9 @@ async def browser_loop():
         "--disable-gpu",
         "--disable-extensions",
         "--disable-software-rasterizer",
-        "--single-process",
-        "--no-zygote",
         "--disable-background-networking",
         "--disable-default-apps",
         "--disable-sync",
-        "--metrics-recording-only",
         "--mute-audio",
         "--no-first-run",
         "--disable-background-timer-throttling",
@@ -246,11 +243,11 @@ async def browser_loop():
             async with async_playwright() as p:
                 log("INFO", "🚀 Запускаю Chromium...")
                 await tg_diag("Запускаю Chromium...")
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=chromium_args,
-                    proxy=proxy,
+                browser = await asyncio.wait_for(
+                    p.chromium.launch(headless=True, args=chromium_args, proxy=proxy),
+                    timeout=90,
                 )
+                await tg_diag("Chromium запущен, открываю контекст...")
                 context = await browser.new_context(
                     user_agent=USER_AGENT,
                     locale="ru-RU",
