@@ -17,6 +17,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
 # ─── Логи (print с flush — надёжно видно в Render) ───────────────────────────
 def log(level, msg):
@@ -240,9 +241,9 @@ async def browser_loop():
 
     while True:
         try:
-            async with async_playwright() as p:
-                log("INFO", "🚀 Запускаю Chromium...")
-                await tg_diag("Запускаю Chromium...")
+            async with Stealth().use_async(async_playwright()) as p:
+                log("INFO", "🚀 Запускаю Chromium (stealth)...")
+                await tg_diag("Запускаю Chromium (stealth-режим)...")
                 browser = await asyncio.wait_for(
                     p.chromium.launch(headless=True, args=chromium_args, proxy=proxy),
                     timeout=90,
@@ -286,8 +287,8 @@ async def browser_loop():
                 await tg_diag(f"📄 Заголовок страницы: «{title}»")
 
                 if "moment" in title.lower() or "attention" in title.lower():
-                    await tg_diag("⚠️ Похоже на Cloudflare-челлендж. Жду 20с...")
-                    await page.wait_for_timeout(20000)
+                    await tg_diag("⚠️ Cloudflare-челлендж. Жду 40с на авто-проход (stealth)...")
+                    await page.wait_for_timeout(40000)
                     title = await page.title()
                     await tg_diag(f"📄 После ожидания: «{title}»")
 
