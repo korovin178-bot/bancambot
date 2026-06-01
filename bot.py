@@ -7,6 +7,7 @@ Bandit.camp Rain Bot v4 — curl_cffi
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -20,9 +21,23 @@ from telegram.error import TelegramError
 import asyncio
 from urllib.parse import quote
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+# ─── Логирование: print с flush, чтобы Render точно показывал из всех потоков ─
+def log_msg(level: str, msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} [{level}] {msg}", flush=True)
+    sys.stdout.flush()
+
+class _Log:
+    def info(self, m):    log_msg("INFO", m)
+    def warning(self, m): log_msg("WARN", m)
+    def error(self, m):   log_msg("ERROR", m)
+    def debug(self, m):   pass  # отключено, чтобы не засорять
+
+log = _Log()
+
+# приглушаем болтливые библиотеки (httpx от telegram)
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
