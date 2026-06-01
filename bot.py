@@ -216,31 +216,39 @@ def fetch_cf_cookies(proxies) -> dict:
     возвращает выданные cookie (включая cf_clearance).
     """
     out = {}
+    # Хосты пробуем по очереди: СНАЧАЛА api.bandit.camp (хост WebSocket!),
+    # потом главная. cf_clearance выдаётся per-host, нам важен именно api.
+    urls = ["https://api.bandit.camp/", "https://bandit.camp/"]
     try:
         session = cffi.Session(impersonate=IMPERSONATE)
-        r = session.get(
-            SITE_URL,
-            headers={"User-Agent": USER_AGENT},
-            proxies=proxies,
-            timeout=30,
-            allow_redirects=True,
-        )
-        log.info(f"🍪 GET {SITE_URL} → HTTP {r.status_code}")
-        # вытаскиваем все cookie из сессии
+        for u in urls:
+            try:
+                r = session.get(
+                    u,
+                    headers={"User-Agent": USER_AGENT, "Referer": "https://bandit.camp/"},
+                    proxies=proxies,
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                log.info(f"🍪 GET {u} → HTTP {r.status_code}")
+                if "just a moment" in (r.text or "").lower():
+                    log.warning(f"🍪 {u}: Cloudflare показывает интерактивный челлендж.")
+            except Exception as e:
+                log.warning(f"🍪 GET {u} ошибка: {type(e).__name__}: {e}")
+
+        # собираем все cookie из сессии (с обоих хостов)
         try:
             jar = session.cookies.get_dict()
         except Exception:
-            jar = dict(r.cookies)
+            jar = {}
         for k, v in jar.items():
             out[k] = v
+
         if "cf_clearance" in out:
-            log.info("🍪 ✅ Получен свежий cf_clearance через прокси!")
+            log.info("🍪 ✅ Получен cf_clearance!")
         else:
             got = ", ".join(out.keys()) if out else "ничего"
             log.warning(f"🍪 ⚠️ cf_clearance НЕ выдан. Пришли cookie: {got}")
-            # признак интерактивного челленджа
-            if "just a moment" in (r.text or "").lower():
-                log.warning("🍪 Cloudflare показывает интерактивный челлендж (нужен браузер).")
     except Exception as e:
         log.error(f"🍪 Ошибка получения cookie: {type(e).__name__}: {e}")
     return out
