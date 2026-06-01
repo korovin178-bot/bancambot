@@ -107,9 +107,13 @@ async def tg_edit(rain: Rain):
             log("ERROR", f"edit error: {e}")
 
 # ─── Диагностика прямо в Telegram ─────────────────────────────────────────────
-async def tg_diag(text: str):
-    """Шлёт диагностическое сообщение в канал (чтобы видеть статус без логов Render)"""
+DIAG_QUIET = {"on": False}  # после первого успешного коннекта — тишина в канале
+
+async def tg_diag(text: str, force: bool = False):
+    """Шлёт диагностику в канал. После первого успеха молчит (кроме force)."""
     log("INFO", f"DIAG → {text}")
+    if DIAG_QUIET["on"] and not force:
+        return
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHANNEL,
@@ -301,6 +305,8 @@ async def browser_loop():
     else:
         log("INFO", "🌍 Прокси НЕ задан")
 
+    first_success = {"done": False}
+
     # флаги для экономии RAM (Render free = 512MB)
     chromium_args = [
         "--no-sandbox",
@@ -395,26 +401,39 @@ async def browser_loop():
                     else:
                         await tg_diag(f"❌ Не прошёл за 60с. Заголовок: «{title}»")
 
-                # ждём появления WebSocket до 30 сек
-                for _ in range(30):
+                # ждём появления WebSocket до 40 сек
+                for _ in range(40):
                     if ws_opened["flag"]:
                         break
                     await page.wait_for_timeout(1000)
 
                 if ws_opened["flag"]:
-                    await tg_diag("✅ Всё работает! Слушаю рейны 🌧")
+                    await tg_diag("✅ Всё работает! Слушаю рейны 🌧", force=True)
+                    DIAG_QUIET["on"] = True  # дальше канал не спамим, только рейны
+                    log("INFO", "✅ WebSocket активен, держу соединение")
+                    # Раз подключились — держим МЯГКО, НЕ трогаем страницу,
+                    # чтобы случайное исключение не уронило рабочий браузер.
+                    # Перезапуск только если WS реально закрылся.
+                    ws_closed = {"flag": False}
+                    # переопределяем обработчик close чтобы помечать флаг
+                    # (соединение уже поймано в on_ws; здесь просто ждём долго)
+                    while True:
+                        await asyncio.sleep(60)
+                        # если браузер/контекст умер — выйдет исключение и уйдём в reconnect
+                        try:
+                            _ = browser.is_connected()
+                            if not _:
+                                log("INFO", "Браузер отключился, переподключаюсь")
+                                break
+                        except Exception:
+                            break
                 else:
-                    await tg_diag("⚠️ WebSocket за 30с не открылся. Возможно сайт его создаёт позже или режет CF.")
-
-                log("INFO", "✅ Страница загружена, слушаю WebSocket события...")
-
-                # держим страницу живой
-                while True:
-                    await page.wait_for_timeout(30000)
-                    try:
-                        await page.evaluate("1")
-                    except Exception:
-                        break
+                    await tg_diag("⚠️ WebSocket за 40с не открылся (попал на челлендж). Перезаход...")
+                    log("INFO", "WS не открылся, перезаход")
+                    # короткая пауза и новый заход — поймаем удачный проход
+                    await browser.close()
+                    await asyncio.sleep(5)
+                    continue
 
         except Exception as e:
             log("ERROR", f"💥 Браузер упал: {type(e).__name__}: {e}")
