@@ -246,6 +246,12 @@ def handle_message(raw: str):
 
 # ─── WebSocket через curl_cffi (в отдельном потоке) ──────────────────────────
 def ws_thread():
+    try:
+        _ws_thread_inner()
+    except Exception as e:
+        log.error(f"💥 ws_thread упал: {type(e).__name__}: {e}")
+
+def _ws_thread_inner():
     headers = {
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
@@ -281,13 +287,16 @@ def ws_thread():
         log.info(f"🔌 Подключаюсь к {WS_URL} (impersonate={IMPERSONATE}, {ck}) ...")
         try:
             session = cffi.Session(impersonate=IMPERSONATE)
-            ws = session.ws_connect(
-                WS_URL,
-                headers=headers,
-                cookies=cookies,
-                proxies=proxies,
-                http_version=CurlHttpVersion.V1_1,
-            )
+            try:
+                ws = session.ws_connect(
+                    WS_URL, headers=headers, cookies=cookies,
+                    proxies=proxies, http_version=CurlHttpVersion.V1_1,
+                )
+            except TypeError:
+                # на случай если версия curl_cffi не принимает http_version
+                ws = session.ws_connect(
+                    WS_URL, headers=headers, cookies=cookies, proxies=proxies,
+                )
             log.info("✅ WebSocket подключён!")
 
             while True:
@@ -348,25 +357,27 @@ async def main():
     global bot, loop
     loop = asyncio.get_running_loop()
 
-    log.info("🚀 Запуск Bandit Rain Bot v4 (curl_cffi)...")
-    bot = Bot(token=TELEGRAM_TOKEN)
-    me = await bot.get_me()
-    log.info(f"✅ Бот @{me.username} готов")
+    # 1) СНАЧАЛА поднимаем keep-alive порт (чтобы Render видел сервис живым)
+    await keep_alive()
 
+    log.info("🚀 Запуск Bandit Rain Bot v4 (curl_cffi)...")
     try:
+        bot = Bot(token=TELEGRAM_TOKEN)
+        me = await bot.get_me()
+        log.info(f"✅ Бот @{me.username} готов")
         await bot.send_message(
             chat_id=TELEGRAM_CHANNEL,
             text="🤖 <b>Rain Bot v4 запущен!</b>\nОтслеживаю рейны на bandit.camp 🌧",
             parse_mode=ParseMode.HTML)
-    except TelegramError as e:
-        log.error(f"Не могу написать в канал: {e}")
+    except Exception as e:
+        log.error(f"Telegram init error: {type(e).__name__}: {e}")
 
-    # WebSocket в отдельном потоке (curl_cffi синхронный)
+    # 2) WebSocket в отдельном потоке
     t = threading.Thread(target=ws_thread, daemon=True)
     t.start()
 
     asyncio.create_task(traffic_reporter())
-    await keep_alive()
+
     # держим event loop живым
     while True:
         await asyncio.sleep(3600)
