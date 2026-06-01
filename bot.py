@@ -377,38 +377,38 @@ async def browser_loop():
                     return any(k in t for k in ("moment", "момент", "attention", "проверк", "just a"))
 
                 if is_challenge(title):
-                    await tg_diag("⚠️ Turnstile-челлендж. Делаю скриншот и пытаюсь нажать...")
-                    # скриншот того что видит бот — отправим в канал
-                    try:
-                        shot = await page.screenshot(full_page=False)
-                        await bot.send_photo(
-                            chat_id=TELEGRAM_CHANNEL,
-                            photo=shot,
-                            caption="📸 Что видит бот на челлендже")
-                    except Exception as e:
-                        log("ERROR", f"screenshot error: {e}")
-                    clicked = await try_click_turnstile(page)
-                    if clicked:
-                        await tg_diag("☑️ Кликнул по галочке, жду прохождения...")
-                    else:
-                        await tg_diag("⚠️ Галочку сразу не нашёл, продолжаю пытаться...")
-
-                    # ждём смены заголовка до 60 сек, повторяя клик каждые 8 сек
+                    await tg_diag("⚠️ Cloudflare проверка. Терпеливо жду авто-прохода (до 2 мин)...")
+                    # Это авто-challenge без галочки — кликать не по чему,
+                    # нужно просто дать ему время «подумать». Иногда проходит
+                    # на 30-90 секунде. Ждём долго, периодически перезагружая.
                     passed = False
-                    for i in range(60):
+                    for i in range(120):
                         await page.wait_for_timeout(1000)
-                        t = await page.title()
+                        try:
+                            t = await page.title()
+                        except Exception:
+                            t = title
                         if not is_challenge(t):
                             passed = True
                             break
-                        if i % 8 == 7:
-                            await try_click_turnstile(page)
+                        # мягкая перезагрузка на 40-й и 80-й секунде — иногда помогает
+                        if i in (40, 80):
+                            try:
+                                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                            except Exception:
+                                pass
 
                     title = await page.title()
                     if passed:
-                        await tg_diag(f"✅ Челлендж пройден! Заголовок: «{title}»")
+                        await tg_diag(f"✅ Проверка пройдена! «{title}»", force=True)
                     else:
-                        await tg_diag(f"❌ Не прошёл за 60с. Заголовок: «{title}»")
+                        await tg_diag("⚠️ Не прошло за 2 мин, перезаход...")
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(5)
+                        continue
 
                 # ждём появления WebSocket до 40 сек
                 for _ in range(40):
