@@ -103,6 +103,19 @@ async def tg_edit(rain: Rain):
         if "not modified" not in str(e).lower():
             log("ERROR", f"edit error: {e}")
 
+# ─── Диагностика прямо в Telegram ─────────────────────────────────────────────
+async def tg_diag(text: str):
+    """Шлёт диагностическое сообщение в канал (чтобы видеть статус без логов Render)"""
+    log("INFO", f"DIAG → {text}")
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHANNEL,
+            text=f"🛠 <i>{text}</i>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
+    except Exception as e:
+        log("ERROR", f"diag send error: {e}")
+
 # ─── Таймер обновления ────────────────────────────────────────────────────────
 async def timer_updater(rain: Rain):
     while rain.status == "active":
@@ -230,6 +243,7 @@ async def browser_loop():
         try:
             async with async_playwright() as p:
                 log("INFO", "🚀 Запускаю Chromium...")
+                await tg_diag("Запускаю Chromium...")
                 browser = await p.chromium.launch(
                     headless=True,
                     args=chromium_args,
@@ -240,45 +254,60 @@ async def browser_loop():
                     locale="ru-RU",
                     viewport={"width": 1280, "height": 720},
                 )
-                # блокируем картинки/шрифты/css — экономим RAM и трафик
+                # блокируем только тяжёлые картинки/видео/шрифты (CSS и JS пропускаем!)
                 async def block_heavy(route_obj):
-                    if route_obj.request.resource_type in ("image", "font", "media", "stylesheet"):
+                    if route_obj.request.resource_type in ("image", "font", "media"):
                         await route_obj.abort()
                     else:
                         await route_obj.continue_()
                 await context.route("**/*", block_heavy)
 
                 page = await context.new_page()
-
                 main_loop = asyncio.get_running_loop()
 
-                # перехват WebSocket
+                ws_opened = {"flag": False}
+
                 def on_ws(ws):
+                    ws_opened["flag"] = True
                     log("INFO", f"🔌 WebSocket открыт: {ws.url}")
+                    asyncio.run_coroutine_threadsafe(
+                        tg_diag(f"🔌 WebSocket открыт: {ws.url}"), main_loop)
                     def on_frame(payload):
                         asyncio.run_coroutine_threadsafe(handle_frame(payload), main_loop)
-                    ws.on("framereceived", lambda p: on_frame(p))
+                    ws.on("framereceived", lambda pl: on_frame(pl))
                     ws.on("close", lambda: log("INFO", "🔌 WebSocket закрыт"))
 
                 page.on("websocket", on_ws)
 
                 log("INFO", f"🌐 Открываю {SITE_URL} ...")
+                await tg_diag(f"Открываю {SITE_URL} через прокси...")
                 await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60000)
                 title = await page.title()
                 log("INFO", f"📄 Заголовок страницы: {title}")
+                await tg_diag(f"📄 Заголовок страницы: «{title}»")
 
-                if "just a moment" in title.lower() or "moment" in title.lower():
-                    log("WARN", "⚠️ Cloudflare челлендж. Жду 15с на авто-прохождение...")
-                    await page.wait_for_timeout(15000)
+                if "moment" in title.lower() or "attention" in title.lower():
+                    await tg_diag("⚠️ Похоже на Cloudflare-челлендж. Жду 20с...")
+                    await page.wait_for_timeout(20000)
                     title = await page.title()
-                    log("INFO", f"📄 После ожидания: {title}")
+                    await tg_diag(f"📄 После ожидания: «{title}»")
+
+                # ждём появления WebSocket до 30 сек
+                for _ in range(30):
+                    if ws_opened["flag"]:
+                        break
+                    await page.wait_for_timeout(1000)
+
+                if ws_opened["flag"]:
+                    await tg_diag("✅ Всё работает! Слушаю рейны 🌧")
+                else:
+                    await tg_diag("⚠️ WebSocket за 30с не открылся. Возможно сайт его создаёт позже или режет CF.")
 
                 log("INFO", "✅ Страница загружена, слушаю WebSocket события...")
 
                 # держим страницу живой
                 while True:
                     await page.wait_for_timeout(30000)
-                    # лёгкая активность чтобы соединение не засыпало
                     try:
                         await page.evaluate("1")
                     except Exception:
@@ -286,6 +315,10 @@ async def browser_loop():
 
         except Exception as e:
             log("ERROR", f"💥 Браузер упал: {type(e).__name__}: {e}")
+            try:
+                await tg_diag(f"💥 Браузер упал: {type(e).__name__}: {str(e)[:200]}")
+            except Exception:
+                pass
 
         log("INFO", "♻️  Перезапуск браузера через 15 сек...")
         await asyncio.sleep(15)
