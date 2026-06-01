@@ -17,6 +17,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 import asyncio
+from urllib.parse import quote
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -38,6 +39,40 @@ VALUE_DIVISOR = 100
 
 # curl_cffi имперсонация — "chrome" = всегда последняя доступная версия
 IMPERSONATE = os.environ.get("IMPERSONATE", "chrome")
+
+# ─── Прокси ───────────────────────────────────────────────────────────────────
+# Можно задать готовый URL в PROXY (http://user:pass@host:port)
+# ИЛИ по частям: PROXY_LOGIN, PROXY_PASS, PROXY_HOST, PROXY_PORT
+def build_proxy() -> Optional[str]:
+    full = os.environ.get("PROXY", "").strip()
+    if full:
+        return full
+
+    login = os.environ.get("PROXY_LOGIN", "").strip()
+    passwd = os.environ.get("PROXY_PASS", "").strip()
+    host = os.environ.get("PROXY_HOST", "").strip()
+    port = os.environ.get("PROXY_PORT", "").strip()
+
+    if host and port:
+        if login and passwd:
+            # URL-кодируем логин и пароль (в логине бывают ; и спецсимволы)
+            l = quote(login, safe="")
+            p = quote(passwd, safe="")
+            return f"http://{l}:{p}@{host}:{port}"
+        return f"http://{host}:{port}"
+    return None
+
+PROXY_URL = build_proxy()
+
+# ─── Счётчик трафика ──────────────────────────────────────────────────────────
+traffic_bytes = 0
+traffic_lock = threading.Lock()
+
+def add_traffic(n: int):
+    global traffic_bytes
+    with traffic_lock:
+        traffic_bytes += n
+
 
 # ─── State ────────────────────────────────────────────────────────────────────
 @dataclass
@@ -181,29 +216,52 @@ def ws_thread():
     if CF_CLEARANCE:
         cookies["cf_clearance"] = CF_CLEARANCE
 
+    proxies = None
+    if PROXY_URL:
+        proxies = {"https": PROXY_URL, "http": PROXY_URL}
+        safe = PROXY_URL
+        if "@" in safe:
+            safe = "http://***@" + safe.split("@", 1)[1]
+        log.info(f"🌍 Использую прокси: {safe}")
+    else:
+        log.info("🌍 Прокси НЕ задан — подключаюсь напрямую")
+
     while True:
-        log.info(f"🔌 Подключаюсь к {WS_URL} (impersonate={IMPERSONATE}) ...")
+        ck = "с cookie" if CF_CLEARANCE else "БЕЗ cookie"
+        log.info(f"🔌 Подключаюсь к {WS_URL} (impersonate={IMPERSONATE}, {ck}) ...")
         try:
             session = cffi.Session(impersonate=IMPERSONATE)
-            ws = session.ws_connect(WS_URL, headers=headers, cookies=cookies)
+            ws = session.ws_connect(
+                WS_URL,
+                headers=headers,
+                cookies=cookies,
+                proxies=proxies,
+            )
             log.info("✅ WebSocket подключён!")
 
             while True:
                 frame = ws.recv()
                 if frame is None:
                     break
-                # ws.recv() может вернуть (data, flags) или просто data
                 data = frame[0] if isinstance(frame, tuple) else frame
-                if isinstance(data, bytes):
+                if isinstance(data, (bytes, bytearray)):
+                    add_traffic(len(data))
                     try:
                         data = data.decode("utf-8")
                     except Exception:
                         continue
+                else:
+                    add_traffic(len(data.encode("utf-8")))
                 if data:
                     handle_message(data)
 
         except Exception as e:
-            log.error(f"WS error: {type(e).__name__}: {e}")
+            msg = str(e)
+            if "403" in msg:
+                log.error("❌ 403 — Cloudflare блокирует даже через прокси/cookie. "
+                          "Проверь совпадение страны прокси и региона cookie.")
+            else:
+                log.error(f"WS error: {type(e).__name__}: {msg}")
 
         log.info("♻️  Переподключение через 10 сек...")
         time.sleep(10)
@@ -213,7 +271,9 @@ async def keep_alive():
     from aiohttp import web
     port = int(os.environ.get("PORT", 10000))
     async def health(request):
-        return web.Response(text=f"OK | active rains: {len(active)}")
+        with traffic_lock:
+            mb = traffic_bytes / (1024 * 1024)
+        return web.Response(text=f"OK | active rains: {len(active)} | traffic: {mb:.2f} MB")
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -221,6 +281,16 @@ async def keep_alive():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
     log.info(f"🌐 Keep-alive на порту {port}")
+
+# ─── Репорт трафика раз в 10 минут ───────────────────────────────────────────
+async def traffic_reporter():
+    while True:
+        await asyncio.sleep(600)
+        with traffic_lock:
+            mb = traffic_bytes / (1024 * 1024)
+        # прогноз на месяц
+        # (грубо: текущий объём за время работы экстраполируем)
+        log.info(f"📊 Трафик с запуска: {mb:.2f} MB")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main():
@@ -244,6 +314,7 @@ async def main():
     t = threading.Thread(target=ws_thread, daemon=True)
     t.start()
 
+    asyncio.create_task(traffic_reporter())
     await keep_alive()
     # держим event loop живым
     while True:
