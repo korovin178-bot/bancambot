@@ -209,51 +209,81 @@ async def keep_alive():
     log("INFO", f"🌐 Keep-alive на порту {port}")
 
 # ─── Клик по Cloudflare Turnstile ─────────────────────────────────────────────
+async def human_click(page, x, y):
+    """Человекоподобное движение мыши к точке и клик (Turnstile следит за поведением)"""
+    import random
+    # стартовая позиция
+    sx, sy = random.randint(100, 400), random.randint(100, 400)
+    await page.mouse.move(sx, sy)
+    # плавное движение в несколько шагов с дрожанием
+    steps = random.randint(15, 25)
+    for i in range(1, steps + 1):
+        nx = sx + (x - sx) * i / steps + random.uniform(-3, 3)
+        ny = sy + (y - sy) * i / steps + random.uniform(-3, 3)
+        await page.mouse.move(nx, ny)
+        await page.wait_for_timeout(random.randint(10, 35))
+    await page.wait_for_timeout(random.randint(200, 500))
+    await page.mouse.move(x, y)
+    await page.wait_for_timeout(random.randint(100, 300))
+    await page.mouse.click(x, y, delay=random.randint(40, 120))
+
+
 async def try_click_turnstile(page) -> bool:
     """
-    Пытается найти и нажать галочку Cloudflare Turnstile.
-    Turnstile живёт в iframe, поэтому пробуем несколько способов.
-    Возвращает True если клик был сделан.
+    Находит галочку Cloudflare Turnstile и нажимает человекоподобно.
+    Галочка в левой части виджета (как на скрине пользователя).
     """
-    # Способ 1: найти iframe Turnstile и кликнуть чекбокс внутри
+    # Способ 1: координаты iframe Turnstile + человекоподобный клик по левой части
+    try:
+        for sel in [
+            "iframe[src*='challenges.cloudflare.com']",
+            "div.cf-turnstile",
+            "#cf-turnstile",
+            "[class*=turnstile]",
+        ]:
+            try:
+                box = await page.locator(sel).first.bounding_box(timeout=3000)
+                if box and box["width"] > 0:
+                    # галочка слева внутри виджета (~30px от левого края)
+                    x = box["x"] + 30
+                    y = box["y"] + box["height"] / 2
+                    await human_click(page, x, y)
+                    log("INFO", f"☑️ Человекоподобный клик ({sel}) x={x:.0f} y={y:.0f}")
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Способ 2: чекбокс внутри iframe через frame_locator
+    try:
+        fl = page.frame_locator("iframe[src*='challenges.cloudflare.com']")
+        for sel in ["input[type=checkbox]", "label", "body"]:
+            try:
+                await fl.locator(sel).first.click(timeout=4000)
+                log("INFO", f"☑️ Клик frame_locator ({sel})")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Способ 3: перебор фреймов
     try:
         for frame in page.frames:
             url = (frame.url or "").lower()
             if "challenges.cloudflare.com" in url or "turnstile" in url:
-                # внутри iframe ищем чекбокс
                 for sel in ["input[type=checkbox]", "label", "#challenge-stage", "body"]:
                     try:
                         el = await frame.wait_for_selector(sel, timeout=3000)
                         if el:
                             await el.click(timeout=3000)
-                            log("INFO", f"☑️ Клик по Turnstile iframe ({sel})")
+                            log("INFO", f"☑️ Клик в iframe ({sel})")
                             return True
                     except Exception:
                         continue
-    except Exception as e:
-        log("INFO", f"turnstile iframe способ не сработал: {e}")
-
-    # Способ 2: клик по видимому контейнеру Turnstile на странице по координатам
-    try:
-        for sel in [
-            "div.cf-turnstile",
-            "#cf-turnstile",
-            "[class*=turnstile]",
-            "iframe[src*=challenges.cloudflare.com]",
-        ]:
-            try:
-                box = await page.locator(sel).first.bounding_box(timeout=3000)
-                if box:
-                    # галочка обычно слева внутри виджета
-                    x = box["x"] + 30
-                    y = box["y"] + box["height"] / 2
-                    await page.mouse.click(x, y)
-                    log("INFO", f"☑️ Клик по координатам Turnstile ({sel})")
-                    return True
-            except Exception:
-                continue
-    except Exception as e:
-        log("INFO", f"turnstile координаты не сработали: {e}")
+    except Exception:
+        pass
 
     return False
 
@@ -336,31 +366,34 @@ async def browser_loop():
                 await tg_diag(f"📄 Заголовок страницы: «{title}»")
 
                 # ── Прохождение Cloudflare Turnstile (клик по галочке) ──────
-                if "moment" in title.lower() or "attention" in title.lower() or "проверк" in title.lower():
+                def is_challenge(t: str) -> bool:
+                    t = t.lower()
+                    return any(k in t for k in ("moment", "момент", "attention", "проверк", "just a"))
+
+                if is_challenge(title):
                     await tg_diag("⚠️ Turnstile-челлендж. Пытаюсь нажать галочку...")
                     clicked = await try_click_turnstile(page)
                     if clicked:
                         await tg_diag("☑️ Кликнул по галочке, жду прохождения...")
                     else:
-                        await tg_diag("⚠️ Галочку не нашёл, жду авто-прохода...")
+                        await tg_diag("⚠️ Галочку сразу не нашёл, продолжаю пытаться...")
 
-                    # ждём смены заголовка до 45 сек
+                    # ждём смены заголовка до 60 сек, повторяя клик каждые 8 сек
                     passed = False
-                    for i in range(45):
+                    for i in range(60):
                         await page.wait_for_timeout(1000)
-                        t = (await page.title()).lower()
-                        if "moment" not in t and "attention" not in t and "проверк" not in t:
+                        t = await page.title()
+                        if not is_challenge(t):
                             passed = True
                             break
-                        # повторная попытка клика на 10-й и 25-й секунде
-                        if i in (10, 25):
+                        if i % 8 == 7:
                             await try_click_turnstile(page)
 
                     title = await page.title()
                     if passed:
                         await tg_diag(f"✅ Челлендж пройден! Заголовок: «{title}»")
                     else:
-                        await tg_diag(f"❌ Не прошёл за 45с. Заголовок: «{title}»")
+                        await tg_diag(f"❌ Не прошёл за 60с. Заголовок: «{title}»")
 
                 # ждём появления WebSocket до 30 сек
                 for _ in range(30):
