@@ -449,6 +449,24 @@ async def browser_loop():
         await asyncio.sleep(15)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
+def get_mem_mb():
+    """Текущее потребление RAM процессом в МБ (без внешних зависимостей)"""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return -1
+
+async def mem_reporter():
+    """Каждые 60с пишет потребление памяти — увидим, упираемся ли в лимит Render (512МБ)"""
+    while True:
+        await asyncio.sleep(60)
+        m = get_mem_mb()
+        log("INFO", f"📊 RAM: {m} MB")
+
 async def main():
     global bot
     await keep_alive()
@@ -465,7 +483,16 @@ async def main():
     except Exception as e:
         log("ERROR", f"Telegram init: {type(e).__name__}: {e}")
 
-    await browser_loop()
+    asyncio.create_task(mem_reporter())
+
+    # Глобальная защита: что бы ни случилось в browser_loop —
+    # ловим и перезапускаем ВНУТРИ процесса, не давая Render рестартовать всё с нуля
+    while True:
+        try:
+            await browser_loop()
+        except Exception as e:
+            log("ERROR", f"💥 browser_loop вылетел: {type(e).__name__}: {e}")
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
